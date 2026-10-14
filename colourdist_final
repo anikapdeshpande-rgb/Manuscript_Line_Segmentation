@@ -1,0 +1,138 @@
+from pathlib import Path
+
+import cv2
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")         
+import matplotlib.pyplot as plt
+
+IMAGE_PATH = r"file_path"               # your page image
+OUT_DIR = Path("lines_out")             # output folder
+
+BLUR_SIZE = 51      
+SIGMA = 14          
+PROMINENCE = 0.15  
+MIN_PEAK_GAP = 60   
+PAD = 8            
+DROP_FAINT = 0.25   
+
+
+def gaussian_smooth(x: np.ndarray, sigma: float) -> np.ndarray:
+   
+    radius = int(4 * sigma + 0.5)
+    k = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
+    k /= k.sum()
+    padded = np.pad(x, radius, mode="symmetric")
+    return np.convolve(padded, k, mode="valid")
+
+
+def find_peaks_simple(x: np.ndarray, prominence: float, distance: int) -> np.ndarray:
+    
+    n = len(x)
+    cands = [i for i in range(1, n - 1) if x[i] > x[i - 1] and x[i] >= x[i + 1]]
+
+    kept = []
+    for i in cands:
+        
+        lo_l = x[i]
+        j = i - 1
+        while j >= 0 and x[j] <= x[i]:
+            lo_l = min(lo_l, x[j])
+            j -= 1
+        lo_r = x[i]
+        j = i + 1
+        while j < n and x[j] <= x[i]:
+            lo_r = min(lo_r, x[j])
+            j += 1
+        if x[i] - max(lo_l, lo_r) >= prominence:
+            kept.append(i)
+
+   
+    kept.sort(key=lambda i: -x[i])
+    final = []
+    for i in kept:
+        if all(abs(i - j) >= distance for j in final):
+            final.append(i)
+    return np.array(sorted(final), dtype=int)
+
+
+def compute_ink_map(img: np.ndarray, blur_size: int) -> np.ndarray:
+    # per-pixel distance of the color from the local background color
+    bg = cv2.medianBlur(img, blur_size)
+    diff = img.astype(np.float32) - bg.astype(np.float32)   
+    ink = np.linalg.norm(diff, axis=2)
+    ink -= np.median(ink)
+    return np.clip(ink, 0, None)
+
+
+def find_cuts(ink: np.ndarray):
+    # return (cuts, peaks, profile, smooth). cuts are the rows between lines
+    profile = ink.sum(axis=1)
+    smooth = gaussian_smooth(profile, SIGMA)
+    peaks = find_peaks_simple(smooth, PROMINENCE * smooth.max(), MIN_PEAK_GAP)
+    if len(peaks) == 0:
+        raise RuntimeError("no lines found")
+
+    cuts = [0]
+    for a, b in zip(peaks[:-1], peaks[1:]):
+        cuts.append(a + int(np.argmin(smooth[a:b])))  
+    cuts.append(len(smooth))
+    return cuts, peaks, profile, smooth
+
+
+def main():
+    img = cv2.imread(IMAGE_PATH)                       # stays BGR 
+    if img is None:
+        raise FileNotFoundError(f"couldn't open the image: {IMAGE_PATH}")
+    h, w = img.shape[:2]
+    print("image size:", img.shape)
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+    ink = compute_ink_map(img, BLUR_SIZE)
+    cv2.imwrite(str(OUT_DIR / "ink_map.png"), (255 * ink / ink.max()).astype(np.uint8))
+
+
+    cuts, peaks, profile, smooth = find_cuts(ink)
+    print(f"{len(peaks)} peaks found at rows: {peaks.tolist()}")
+
+    # plot
+    rows = np.arange(len(profile))
+    plt.figure(figsize=(6, 10))
+    plt.plot(profile, rows, color="lightgray", label="raw")
+    plt.plot(smooth, rows, color="red", label="smoothed")
+    plt.scatter(smooth[peaks], peaks, color="blue", zorder=3, label="lines")
+    for y in cuts:
+        plt.axhline(y, color="green", lw=0.8)
+    plt.gca().invert_yaxis()
+    plt.xlabel("ink amount")
+    plt.ylabel("row number")
+    plt.legend()
+    plt.savefig(OUT_DIR / "profile.png", dpi=100)
+    plt.close()
+
+    # build bands and drop faint ones 
+    bands = list(zip(cuts[:-1], cuts[1:]))
+    band_ink = np.array([ink[t:b].sum() for t, b in bands])
+    keep = band_ink >= DROP_FAINT * np.median(band_ink)
+    bands = [bd for bd, k in zip(bands, keep) if k]
+    print(f"Keeping {len(bands)} of {len(keep)} bands")
+
+    # overlay
+    vis = img.copy()
+    for top, bottom in bands:
+        cv2.line(vis, (0, top), (w, top), (0, 0, 255), 2)
+        cv2.line(vis, (0, bottom - 1), (w, bottom - 1), (0, 0, 255), 2)
+    cv2.imwrite(str(OUT_DIR / "cuts_overlay.png"), vis)
+
+    # cropping and saving the lines
+    for i, (top, bottom) in enumerate(bands, 1):
+        crop = img[max(0, top - PAD):min(h, bottom + PAD), :]
+        cv2.imwrite(str(OUT_DIR / f"line_{i:03d}.png"), crop)
+
+    print(f"saved {len(bands)} line images to {OUT_DIR.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
